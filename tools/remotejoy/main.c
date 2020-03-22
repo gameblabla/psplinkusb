@@ -10,6 +10,7 @@
  * $HeadURL: svn://svn.ps2dev.org/psp/trunk/psplinkusb/tools/remotejoy/main.c $
  * $Id: main.c 2204 2007-03-11 19:16:01Z tyranid $
  */
+#include <pspiofilemgr.h>
 #include <pspkernel.h>
 #include <pspdebug.h>
 #include <pspkdebug.h>
@@ -25,7 +26,19 @@
 #include <string.h>
 #include <usbasync.h>
 #include <apihook.h>
+#include "pspdefs.h"
 #include "remotejoy.h"
+
+#define LOG_PRINTF(fmt, ...)
+/*#define LOG_PRINTF(fmt, ...) \
+{ \
+        int fd; \
+        char tempbuf[200]; \
+        fd = sceIoOpen("ms0:/remotejoy.txt", PSP_O_CREAT | PSP_O_WRONLY | PSP_O_APPEND, 0777); \
+        sprintf(tempbuf, fmt, ## __VA_ARGS__); \
+        sceIoWrite(fd, tempbuf, strlen(tempbuf)); \
+        sceIoClose(fd); \
+}*/
 
 PSP_MODULE_INFO("RemoteJoy", PSP_MODULE_KERNEL, 1, 1);
 
@@ -42,7 +55,13 @@ PSP_MODULE_INFO("RemoteJoy", PSP_MODULE_KERNEL, 1, 1);
 //#define DEBUG_PRINTF(x, ...) printf(x, ## __VA_ARGS__)
 #define DEBUG_PRINTF(x, ...)
 
+
 SceCtrlData g_currjoy;
+u32 baseaddr;	//AHMAN
+u32 saveSetFrameBufInstr[2];
+int screen_thread_active;
+int main_thread_active;
+int g_thid;
 struct AsyncEndpoint g_endp;
 SceUID g_scrthid = -1;
 SceUID g_scrsema = -1;
@@ -58,6 +77,9 @@ int scePowerVolatileMemLock(int, char**, int*);
 unsigned int psplinkSetK1(unsigned int k1);
 extern u32 sceKernelSetDdrMemoryProtection;
 int (*g_ctrl_common)(SceCtrlData *, int count, int type);
+int (* vshCtrlReadBufferPositive)(SceCtrlData* pad_data, int count);
+u32 sctrlHENFindFunction(char *modname, char *libname, u32 nid);
+int sceKernelGetModel(void);
 
 #define ASYNC_JOY ASYNC_USER
 #define ABS(x) ((x) < 0 ? -x : x)
@@ -130,6 +152,85 @@ void add_values(SceCtrlData *pad_data, int count, int neg)
 	pspSdkEnableInterrupts(intc);
 }
 
+int read_buffer_positive(SceCtrlData *pad_data, int count)
+{
+	int ret;
+
+	ret = sceCtrlReadBufferPositive(pad_data, count);
+	if(ret <= 0)
+	{
+		return ret;
+	}
+
+	add_values(pad_data, ret, 0);
+
+	return ret;
+}
+
+int peek_buffer_positive(SceCtrlData *pad_data, int count)
+{
+	int ret;
+
+	ret = sceCtrlPeekBufferPositive(pad_data, count);
+	if(ret <= 0)
+	{
+		return ret;
+	}
+
+	add_values(pad_data, ret, 0);
+
+	return ret;
+}
+
+int read_buffer_negative(SceCtrlData *pad_data, int count)
+{
+	int ret;
+
+	ret = sceCtrlReadBufferNegative(pad_data, count);
+	if(ret <= 0)
+	{
+		return ret;
+	}
+
+	add_values(pad_data, ret, 1);
+
+	return ret;
+}
+
+int peek_buffer_negative(SceCtrlData *pad_data, int count)
+{
+	int ret;
+
+	ret = sceCtrlPeekBufferNegative(pad_data, count);
+	if(ret <= 0)
+	{
+		return ret;
+	}
+
+	add_values(pad_data, ret, 1);
+
+	return ret;
+}
+
+int vsh_read_buffer_positive(SceCtrlData *pad_data, int count)
+{
+	int ret;
+
+    u32 orgaddr = sctrlHENFindFunction("sceVshBridge_Driver", "sceVshBridge", 0xC6395C03);
+    vshCtrlReadBufferPositive = (void *)orgaddr;
+
+	ret = vshCtrlReadBufferPositive(pad_data, count);
+		
+	if(ret <= 0)
+	{
+		return ret;
+	}
+
+	add_values(pad_data, ret, 0);
+
+	return ret;
+}
+
 int ctrl_hook_func(SceCtrlData *pad_data, int count, int type)
 {
 	int ret;
@@ -143,28 +244,6 @@ int ctrl_hook_func(SceCtrlData *pad_data, int count, int type)
 	add_values(pad_data, ret, type & 1);
 
 	return ret;
-}
-
-int hook_ctrl_function(unsigned int* jump)
-{
-	unsigned int target;
-	unsigned int func;
-	int inst;
-
-	target = GET_JUMP_TARGET(*jump);
-	inst = _lw(target+8);
-	if((inst & ~0x03FFFFFF) != 0x0C000000)
-	{
-		return 1;
-	}
-
-	g_ctrl_common = (void*) GET_JUMP_TARGET(inst);
-
-	func = (unsigned int) ctrl_hook_func;
-	func = (func & 0x0FFFFFFF) >> 2;
-	_sw(0x0C000000 | func, target+8);
-
-	return 0;
 }
 
 void copy16to16(void *in, void *out);
@@ -190,7 +269,7 @@ int copy_32bpp_raw(void *topaddr)
 
 int copy_32bpp_vfpu(void *topaddr)
 {
-	struct JoyScrHeader *head = (struct JoyScrHeader*) (0x40000000 | (u32) g_scrptr);
+	struct JoyScrHeader *head = (struct JoyScrHeader*) ((u32) g_scrptr);
 
 	sceKernelDcacheWritebackInvalidateRange(g_scrptr, sizeof(struct JoyScrHeader));
 	copy32to16(topaddr, (g_scrptr + sizeof(struct JoyScrHeader)));
@@ -289,13 +368,13 @@ inline int build_frame(void)
 	void *topaddr;
 	int bufferwidth;
 	int pixelformat;
-	int sync;
+	int sync = 0;
 	
 	/* Get the top level frame buffer, else get the normal frame buffer */
-	sceDisplayGetFrameBufferInternal(0, &topaddr, &bufferwidth, &pixelformat, &sync);
+	sceDisplayGetFrameBufferInternal(0, &topaddr, &bufferwidth, &pixelformat, sync);
 	if(topaddr == NULL)
 	{
-		sceDisplayGetFrameBufferInternal(2, &topaddr, &bufferwidth, &pixelformat, &sync);
+		sceDisplayGetFrameBufferInternal(2, &topaddr, &bufferwidth, &pixelformat, sync);
 	}
 
 	if(topaddr)
@@ -343,36 +422,60 @@ int screen_thread(SceSize args, void *argp)
 	struct JoyScrHeader *head;
 	int size;
 	u32* p;
-	u32 baseaddr;
 	u32 func;
 
-	/* Should actually hook the memory correctly :/ */
+	// AHMAN  Disable the use of memory at 0x08800000 to avoid game crashing
+	// ChaoticXSinZ  Use 0x08800000 if in VSH since others crash it
+	//g_scrptr = 0x88380000; // PHAT
+	//g_scrptr = 0x0A000000; // SLIM (brite & go as well?)
+	
+	// to check if the vsh module is loaded meaning we are in the vsh
+	SceModule* pMod = sceKernelFindModuleByName("vsh_module");
+	
+	if (pMod == NULL) {
+	
+	    DEBUG_PRINTF("Not VSH.\n");
+	
+	    // can't find module thus not in VSH
+	
+        if (sceKernelGetModel() <= 0)
+            g_scrptr = (char*)0x88380000;
+        else
+            g_scrptr = (char*)0x0A000000;
+            
+    } else {
+    
+        DEBUG_PRINTF("VSH.\n");
+    
+        _sw(0xFFFFFFFF, 0xBC00000C);
+        g_scrptr = (char*) (0x08800000-(512*1024));
+        
+        if(sceKernelDevkitVersion() >= 0x01050001) {
+        
+            p = &sceKernelSetDdrMemoryProtection;
 
-	/* Enable free memory */
-	_sw(0xFFFFFFFF, 0xBC00000C);
-	g_scrptr = (char*) (0x08800000-(512*1024));
-
+            baseaddr = GET_JUMP_TARGET(*p);
+            _sw(0x03E00008, baseaddr);
+            _sw(0x00001021, baseaddr+4);
+            sceKernelDcacheWritebackInvalidateRange((void*) baseaddr, 8);
+            sceKernelIcacheInvalidateRange((void*) baseaddr, 8);
+            
+        }
+    
+    }
+	    
 	g_scrsema = sceKernelCreateSema("ScreenSema", 0, 1, 1, NULL);
 	if(g_scrsema < 0)
 	{
 		DEBUG_PRINTF("Could not create sema 0x%08X\n", g_scrsema);
 		sceKernelExitDeleteThread(0);
 	}
-
-	if(sceKernelDevkitVersion() >= 0x01050001)
-	{
-		p = &sceKernelSetDdrMemoryProtection;
-
-		baseaddr = GET_JUMP_TARGET(*p);
-		_sw(0x03E00008, baseaddr);
-		_sw(0x00001021, baseaddr+4);
-		sceKernelDcacheWritebackInvalidateRange((void*) baseaddr, 8);
-		sceKernelIcacheInvalidateRange((void*) baseaddr, 8);
-	}
-
+	
 	p = (u32*) sceDisplaySetFrameBuf;
 
 	baseaddr = GET_JUMP_TARGET(*p);
+	saveSetFrameBufInstr[0] = *((int *) baseaddr);
+	saveSetFrameBufInstr[1] = *((int *) (baseaddr+4));
 	func = (unsigned int) set_frame_buf;
 	func = (func & 0x0FFFFFFF) >> 2;
 	_sw(0x08000000 | func, baseaddr);
@@ -391,10 +494,11 @@ int screen_thread(SceSize args, void *argp)
 		usbWriteBulkData(ASYNC_JOY, g_scrptr, sizeof(struct JoyScrHeader) + size);
 	}
 
-	while(1)
+	screen_thread_active = 1;
+	while(screen_thread_active)	//AHMAN
 	{
 		int ret;
-		unsigned int status;
+		u32 status;
 		SceUInt timeout;
 
 		timeout = SCREEN_WAIT_TIMEOUT;
@@ -439,11 +543,13 @@ int screen_thread(SceSize args, void *argp)
 		}
 	}
 
+	sceKernelExitDeleteThread(0);	//AHMAN
 	return 0;
 }
 
 void do_screen_cmd(unsigned int value)
 {
+
 	if(value & SCREEN_CMD_FULLCOLOR)
 	{
 		copy_32bpp = copy_32bpp_raw;
@@ -478,7 +584,7 @@ void do_screen_cmd(unsigned int value)
 				return;
 			}
 
-			g_scrthid = sceKernelCreateThread("ScreenThread", screen_thread, 16, 0x800, PSP_THREAD_ATTR_VFPU, NULL);
+			g_scrthid = sceKernelCreateThread("RemoteJoyScreenThread", screen_thread, 16, 0x800, PSP_THREAD_ATTR_VFPU, NULL);
 			if(g_scrthid >= 0)
 			{
 				sceKernelStartThread(g_scrthid, 0, NULL);
@@ -525,7 +631,11 @@ int main_thread(SceSize args, void *argp)
 {
 	struct JoyEvent joyevent;
 	int intc;
+	
+	sceKernelDelayThread(250000);
 
+	//g_scrptr = (char *) 0x88380000;
+	g_scrptr = (char *) atoi(argp+strlen(argp)+1);
 #ifdef BUILD_PLUGIN
 	int retVal = 0;
 
@@ -543,15 +653,49 @@ int main_thread(SceSize args, void *argp)
 
 	retVal = sceUsbActivate(HOSTFSDRIVER_PID);
 #endif
-
-	if(hook_ctrl_function((unsigned int*) sceCtrlReadBufferPositive) || 
-		hook_ctrl_function((unsigned int*) sceCtrlPeekBufferPositive) ||
-		hook_ctrl_function((unsigned int*) sceCtrlReadBufferNegative) ||
-		hook_ctrl_function((unsigned int*) sceCtrlPeekBufferNegative))
+	
+	SceModule* pMod = sceKernelFindModuleByName("sceController_Service");
+	if(pMod == NULL)
 	{
-		DEBUG_PRINTF("Could not hook controller functions\n");
-		sceKernelExitDeleteThread(0);
+		DEBUG_PRINTF("Could not get controller module\n");
+		sceKernelTerminateDeleteThread(0);
 	}
+
+	if(apiHookByName(pMod->modid, "sceCtrl", "sceCtrlReadBufferPositive", read_buffer_positive) == 0)
+	{
+		DEBUG_PRINTF("Could not hook controller function\n");
+		sceKernelTerminateDeleteThread(0);
+	}
+
+	if(apiHookByName(pMod->modid, "sceCtrl", "sceCtrlPeekBufferPositive", peek_buffer_positive) == 0)
+	{
+		DEBUG_PRINTF("Could not hook controller function\n");
+		sceKernelTerminateDeleteThread(0);
+	}
+
+	if(apiHookByName(pMod->modid, "sceCtrl", "sceCtrlReadBufferNegative", peek_buffer_negative) == 0)
+	{
+		DEBUG_PRINTF("Could not hook controller function\n");
+		sceKernelTerminateDeleteThread(0);
+	}
+
+	if(apiHookByName(pMod->modid, "sceCtrl", "sceCtrlPeekBufferNegative", peek_buffer_negative) == 0)
+	{
+		DEBUG_PRINTF("Could not hook controller function\n");
+		sceKernelTerminateDeleteThread(0);
+	}
+
+	pMod = sceKernelFindModuleByName("sceVshBridge_Driver");
+
+	// Ignore if we dont find vshbridge
+	if(pMod)
+	{
+		if(apiHookByName(pMod->modid, "sceVshBridge","vshCtrlReadBufferPositive", vsh_read_buffer_positive) == 0)
+		{
+			DEBUG_PRINTF("Could not hook controller function\n");
+		}
+	}
+	
 	sceKernelDcacheWritebackInvalidateAll();
 	sceKernelIcacheInvalidateAll();
 
@@ -566,7 +710,8 @@ int main_thread(SceSize args, void *argp)
 	/* Send a probe packet for screen display */
 	send_screen_probe();
 
-	while(1)
+	main_thread_active = 1;
+	while(main_thread_active)
 	{
 		int len;
 		len = usbAsyncRead(ASYNC_JOY, (void*) &joyevent, sizeof(joyevent));
@@ -609,22 +754,23 @@ int main_thread(SceSize args, void *argp)
 		scePowerTick(0);
 	}
 
+	sceKernelExitDeleteThread(0);	//AHMAN
 	return 0;
 }
 
 /* Entry point */
 int module_start(SceSize args, void *argp)
 {
-	int thid;
 
 	memset(&g_currjoy, 0, sizeof(g_currjoy));
 	g_currjoy.Lx = 0x80;
 	g_currjoy.Ly = 0x80;
+	
 	/* Create a high priority thread */
-	thid = sceKernelCreateThread("RemoteJoy", main_thread, 15, 0x800, 0, NULL);
-	if(thid >= 0)
+	g_thid = sceKernelCreateThread("RemoteJoy", main_thread, 15, 0x800, 0, NULL);
+	if(g_thid >= 0)
 	{
-		sceKernelStartThread(thid, args, argp);
+		sceKernelStartThread(g_thid, args, argp);
 	}
 	return 0;
 }
